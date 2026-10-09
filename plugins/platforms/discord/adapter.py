@@ -4092,6 +4092,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return
             transcript = result.get("transcript", "").strip()
             if not transcript or is_whisper_hallucination(transcript):
+                # Log the drop: a silent return here was the only path in the voice loop with
+                # zero observability ("I spoke but got no response" was undiagnosable — 2026-10-09
+                # a near-silence post-rejoin clip hallucinated 10 chars and vanished without a trace).
+                logger.info(
+                    "Voice input dropped (silent/whisper hallucination) from user %d: %r",
+                    user_id, transcript[:50],
+                )
                 return
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
             if self._voice_input_callback:
