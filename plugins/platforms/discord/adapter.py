@@ -3938,6 +3938,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self._voice_streaming_sources = {}
         self._voice_streaming_sources[guild_id] = (source, receiver)
         done = asyncio.Event()
+        # Capture the loop up front: _after runs on discord.py's audio-player thread, where
+        # asyncio.get_event_loop() raises on Python 3.12+ (no running loop in that thread).
+        loop = asyncio.get_running_loop()
 
         def _after(error):
             if error:
@@ -3945,7 +3948,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if receiver:
                 with suppress(Exception):
                     receiver.resume()
-            loop = asyncio.get_event_loop()
             with suppress(Exception):
                 loop.call_soon_threadsafe(done.set)
 

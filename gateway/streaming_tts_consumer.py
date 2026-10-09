@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -49,6 +50,9 @@ class StreamingTTSConsumer:
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
+        # Monotonic timestamp of the last audible progress (task start / clause fetch / PCM write).
+        # Callers use it to tell "slow but progressing" (keep waiting) from "stuck" (abort).
+        self._last_progress = time.monotonic()
 
     def _streamer_format(self) -> AudioFormat:
         return AudioFormat(**{f: int(getattr(self._streamer, f, getattr(AudioFormat, f)))
@@ -111,8 +115,15 @@ class StreamingTTSConsumer:
     def start(self) -> asyncio.Task:
         """Create (once) and return the async drain task on the gateway loop."""
         if self._task is None:
+            self._last_progress = time.monotonic()
             self._task = self._loop.create_task(self._run())
         return self._task
+
+    @property
+    def progressing(self) -> bool:
+        """The drain task was created and has not been aborted — wait_complete() will honour
+        the progress rule rather than the fixed staleness window."""
+        return self._task is not None and not self._aborted
 
     def _settle(self, *, failed: bool) -> None:
         """Set outcome flags from what was audible: never report completion after a failure or a
@@ -153,6 +164,7 @@ class StreamingTTSConsumer:
                     break
                 if not isinstance(item, str):
                     continue
+                self._last_progress = time.monotonic()  # fresh clause fetched: pipeline is moving
                 try:
                     await self._synthesise_and_write(item)
                 except _HandleDeclined:
@@ -206,6 +218,7 @@ class StreamingTTSConsumer:
             await self._adapter.write_streaming_tts(self._handle, chunk)
             if not was_audible:
                 self._handle.audible = self._suppress_whole_file = True
+            self._last_progress = time.monotonic()  # PCM reached the adapter: still progressing
 
     async def _safe_abort(self, reason: str) -> None:
         """Abort the adapter stream, swallowing errors (idempotent)."""
@@ -231,9 +244,38 @@ class StreamingTTSConsumer:
             with contextlib.suppress(Exception):
                 self._loop.call_soon_threadsafe(asyncio.create_task, self._safe_abort(reason))
 
-    async def wait_complete(self, timeout: float = 10.0) -> bool:
-        """Wait for the drain task to finish. Returns True only on full success."""
-        if self._task is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+    async def wait_complete(self, timeout: float = 10.0, *,
+                            grace: float = 30.0, max_wait: float = 600.0) -> bool:
+        """Wait for the drain task to finish. Returns True only on full success.
+
+        *timeout* is the **staleness window**: with no progress (no clause fetched, no PCM
+        written) it bounds how long to keep waiting.  *grace* extends the no-progress allowance
+        while the pipeline is still progressing — a slow long reply (per-clause synthesis far
+        exceeding the legacy 10 s hard cap) is waited out instead of being aborted mid-speech,
+        bounded by *max_wait* against a genuinely stuck provider.  Callers that call this right
+        AFTER aborting need no special arguments: ``progressing`` is then False and the fixed
+        *timeout* window applies, so cleanup returns promptly.  Test fakes without the progress
+        stamp get the same legacy fixed-window behaviour.
+        """
+        if self._task is None:
+            return self._completed
+        start = time.monotonic()
+        ceiling = start + max_wait
+        if self.progressing:
+            idle_limit = max(timeout, grace)
+        else:
+            idle_limit = timeout
+        while not self._task.done():
+            now = time.monotonic()
+            if now >= ceiling:
+                return self._completed  # absolute ceiling: give up on a stuck provider
+            last = getattr(self, "_last_progress", None)
+            if last is None:
+                if now - start > timeout:  # legacy fixed window (no progress signal available)
+                    return self._completed
+            elif now - last > idle_limit:
+                return self._completed  # stale beyond the (graced) window
+            await asyncio.sleep(0.2)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.shield(self._task)
         return self._completed

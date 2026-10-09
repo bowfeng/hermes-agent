@@ -3616,11 +3616,14 @@ class GatewayTurnMixin:
             return
         _stts.finish()
         try:
+            # Progress-aware wait: keep going while clauses keep flowing (long replies exceed the
+            # legacy 10 s hard cap); a stalled pipeline gives up after the grace window.
             await _stts.wait_complete(timeout=10.0)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
         if not _stts.done:
             _stts.abort("streaming TTS finalisation timeout")
+            # Post-abort wait_complete uses the fixed timeout (progressing is False): bounded cleanup.
             await _stts.wait_complete(timeout=2.0)
         if _stts.suppress_whole_file and adapter is not None:
             _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)

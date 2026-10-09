@@ -644,8 +644,10 @@ class TestPostAudioTimeoutAbort:
             assert consumer.audible is True
             assert consumer.suppress_whole_file is True
 
-            # Timeout: the consumer should be aborted, not left running.
-            completed = await consumer.wait_complete(timeout=0.01)
+            # Stale beyond the staleness window (grace=0): the consumer should be aborted, not
+            # left running.  (The gateway default keeps grace while progressing; this test wants
+            # the fixed staleness window.)
+            completed = await consumer.wait_complete(timeout=0.01, grace=0.0)
             assert completed is False
             assert consumer.suppress_whole_file is True
 
@@ -656,6 +658,16 @@ class TestPostAudioTimeoutAbort:
             # The consumer must not complete later in the background.
             assert consumer.completed is False
             assert consumer._aborted is True
+            # Post-abort: progressing is False, so cleanup uses the fixed timeout.
+            assert await consumer.wait_complete(timeout=0.5) is False
+            # Release the blocking streamer so the drain task can observe the abort and exit
+            # cleanly before the loop closes (no "Task was destroyed but it is pending").
+            streamer.allow_remaining_chunks.set()
+            for _ in range(50):
+                if consumer.done:
+                    break
+                await asyncio.sleep(0.1)
+            assert consumer.done is True
 
         _run_test(run)
 
@@ -690,3 +702,77 @@ class TestEndpointReportedRate:
             assert len(adapter.written_chunks) == 2
 
         _run_test(run)
+
+
+# ---------------------------------------------------------------------------
+# Progress-aware finalisation: slow streams are waited on, stuck ones give up
+# ---------------------------------------------------------------------------
+
+
+class _SlowPerClauseStreamer(FakeStreamer):
+    """Synthesises each clause with a delay; stamps progress while working (as the real
+    consumer stamps clause-fetch + PCM-write)."""
+
+    def __init__(self, delay: float = 0.5, consumer: Any = None):
+        super().__init__(chunks_per_clause=1)
+        self.delay = delay
+        self._consumer = consumer
+
+    def stream(self, text: str):
+        import time as _time
+        if self._consumer is not None:
+            self._consumer._last_progress = _time.monotonic()
+        _time.sleep(self.delay)
+        if self._consumer is not None:
+            self._consumer._last_progress = _time.monotonic()
+        yield b"pcm"
+
+
+def test_slow_stream_is_waited_out_not_aborted():
+    """A reply whose clauses take longer than the 10 s hard cap to synthesise must still be
+    waited out to completion — this is the bug where long replies were cut to a few fragments
+    (finalisation aborted after a fixed 10 s)."""
+    async def run(loop):
+        adapter = FakeVoiceAdapter()
+        consumer = _make_consumer(adapter, "chat1", loop, None)
+        streamer = _SlowPerClauseStreamer(delay=0.5, consumer=consumer)
+        consumer._streamer = streamer
+        consumer.start()
+        # Each sentence is > 20 chars so the chunker (min_len=20) emits one clause per feed:
+        # 5 clauses x 0.5 s = 2.5 s total, > the 1 s staleness window.
+        for i in range(5):
+            consumer.on_delta(f"Number {i} is the spoken sentence. ")
+        consumer.finish()
+        completed = await consumer.wait_complete(timeout=1.0)
+        assert completed is True
+        assert consumer.completed is True
+        assert len(adapter.written_chunks) == 5
+
+    _run_test(run, timeout=15.0)
+
+
+def test_stuck_stream_gives_up_after_grace():
+    """A consumer that never makes progress must still be given up on (bounded), so a dead
+    provider cannot hold the turn forever."""
+    async def run(loop):
+        adapter = FakeVoiceAdapter()
+        consumer = _make_consumer(adapter, "chat1", loop, FakeStreamer(chunks_per_clause=1))
+        consumer.start()
+        consumer.on_delta("One sentence. ")
+        # Do NOT finish() and never make progress: the drain task waits on the queue.
+        started = time.monotonic()
+        completed = await consumer.wait_complete(timeout=0.5, grace=0.5)
+        assert completed is False
+        assert consumer.done is False
+        assert time.monotonic() - started < 3.0
+        consumer.abort("test cleanup")
+        await consumer.wait_complete(timeout=1.0)
+        assert consumer._aborted is True
+        # Let the drain task drain the _ABORT sentinel and exit before the loop closes.
+        for _ in range(50):
+            if consumer.done:
+                break
+            await asyncio.sleep(0.1)
+        assert consumer.done is True
+
+    _run_test(run, timeout=15.0)
