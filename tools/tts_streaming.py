@@ -195,6 +195,72 @@ def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:
         yield chunk
 
 
+@register("voxcpm2")
+class VoxCPM2CommandStreamer(StreamingTTSProvider):
+    """User-configured ``tts.providers.voxcpm2: {type: command}`` TTS as a streaming provider.
+
+    The command synthesises per sentence (same path as the sync provider); the adapter
+    receives ready 48 kHz / stereo / s16le PCM, so playback of clause N+1 can overlap the
+    tail of clause N instead of waiting for the whole reply. ``available`` requires the
+    command config + ffmpeg; a sentence failure raises and the gateway falls back to
+    whole-file TTS when nothing was audible yet.
+    """
+
+    # Disclosed format: the stream() output is always 48k/stereo/s16le after decode.
+    sample_rate = 48000
+    channels = 2
+    sample_width = 2
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            from tools.tts_command_provider import _resolve_command_provider_config
+            from tools.tts_tool import _load_tts_config
+            from shutil import which
+            # Same resolution the sync path uses (line 440 of tts_tool.py): None means the
+            # configured provider is not a command-type entry, so streaming can't ride it.
+            cfg = _load_tts_config()
+            section = _resolve_command_provider_config("voxcpm2", cfg)
+            if section is None:
+                return False
+            return which("ffmpeg") is not None
+        except Exception:
+            return False
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        from tools.tts_command_provider import _generate_command_tts, _resolve_command_provider_config
+        from tools.tts_tool import _load_tts_config
+
+        cfg = _load_tts_config()
+        section = _resolve_command_provider_config("voxcpm2", cfg)
+        if section is None:
+            raise RuntimeError("voxcpm2 command TTS provider is not configured")
+        with tempfile.TemporaryDirectory(prefix="tts_stream_") as tmp:
+            out_path = str(Path(tmp) / "out.wav")
+            # Same call the sync provider makes — command resolves {text_path}/{output_path}.
+            _generate_command_tts(text, out_path, "voxcpm2", section, cfg)
+            # 48k / stereo / s16le — the format the Discord VC source consumes.
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", out_path,
+                 "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"],
+                capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"voxcpm2 stream decode failed (rc={proc.returncode}): "
+                f"{(proc.stderr or b'').decode('utf-8', 'replace')[:200]}")
+        if not proc.stdout:
+            raise RuntimeError("voxcpm2 stream produced no PCM")
+        # Yield the whole decoded sentence: the consumer plays clause N+1 only after
+        # clause N drained, so a single chunk per clause is already gap-free and keeps
+        # the provider thread simple (no queue plumbing needed).
+        yield proc.stdout
+
+
 @register("elevenlabs")
 class ElevenLabsStreamer(StreamingTTSProvider):
     """ElevenLabs chunked HTTP → pcm_24000 (the original reference path)."""

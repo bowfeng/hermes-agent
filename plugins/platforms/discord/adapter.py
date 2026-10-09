@@ -258,6 +258,68 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 
+class _StreamingVoiceSource((discord.AudioSource if DISCORD_AVAILABLE else object)):
+    """Continuous 20 ms-frame PCM source fed by the streaming-TTS consumer.
+
+    ``push`` (gateway loop / worker thread) appends 48 kHz / stereo / s16le PCM;
+    ``read`` (discord.py's AudioPlayer thread) returns exactly one 3840-byte frame,
+    blocking up to 200 ms so gaps between clauses stay silence instead of underruns.
+    ``finish`` pads the tail frame and lets ``read`` return ``b''`` once drained,
+    which stops the player so the next turn's (legacy or streamed) source installs
+    cleanly. Frames are dropped after ``finish``/``cleanup`` — late producer chunks
+    must not raise (adapter contract: abort is idempotent).
+    """
+
+    FRAME_SIZE = 3840  # 48000 Hz * 2 ch * 2 bytes * 20 ms (== discord OpusEncoder.FRAME_SIZE)
+
+    def __init__(self) -> None:
+        from collections import deque
+        self._frames: "deque" = deque()
+        self._pending = b""
+        self._done = False
+        self._cv = threading.Condition()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def push(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        with self._cv:
+            if self._done:
+                return
+            self._pending += pcm
+            while len(self._pending) >= self.FRAME_SIZE:
+                self._frames.append(self._pending[:self.FRAME_SIZE])
+                self._pending = self._pending[self.FRAME_SIZE:]
+            self._cv.notify_all()
+
+    def finish(self) -> None:
+        """End of stream: flush the partial tail frame, then let ``read`` return ``b''`` once
+        the queue drains (which stops discord.py's player so the next turn's source installs)."""
+        with self._cv:
+            if self._pending:
+                self._frames.append(self._pending.ljust(self.FRAME_SIZE, b"\x00"))
+                self._pending = b""
+            self._done = True
+            self._cv.notify_all()
+
+    def read(self) -> bytes:
+        with self._cv:
+            while not self._frames and not self._done:
+                self._cv.wait(timeout=0.2)
+            if self._frames:
+                return self._frames.popleft()
+            return b""  # finished and drained: stop the player
+
+    def cleanup(self) -> None:
+        with self._cv:
+            self._done = True
+            self._frames.clear()
+            self._pending = b""
+            self._cv.notify_all()
+
+
 def _is_discord_transport_error(exc: BaseException) -> bool:
     """True for connection-shaped send failures (dead/dropping WS) that never reached Discord, so
     the delivery ledger can replay them; timeouts excluded (a timed-out send may have landed).
@@ -310,7 +372,9 @@ from gateway.platforms.base import (
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
+    AudioFormat, StreamingTTSHandle,
 )
+from dataclasses import dataclass as _dataclass
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
 from gateway.platforms._shared import (
@@ -319,6 +383,13 @@ from gateway.platforms._shared import (
     yaml_env_setter as _yaml_env_setter
 )
 
+
+@_dataclass
+class _DiscordStreamingTTSHandle(StreamingTTSHandle):
+    """Platform state for a streaming-TTS session over a connected VC (base handle + VC plumbing)."""
+    _guild_id: int = 0
+    _source: Optional[Any] = None  # _StreamingVoiceSource
+    _done_event: Optional[Any] = None  # asyncio.Event set when the player thread ends
 
 
 def _unauthorized() -> str:
@@ -1108,6 +1179,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
         # Continuous voice mixer per guild (ambient bed + ducked speech) so acks/TTS/thinking overlap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._voice_streaming_sources: Dict[int, Any] = {}  # guild_id -> (source, receiver) streaming TTS
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
@@ -3807,6 +3879,123 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Check if the bot is connected to a voice channel in this guild."""
         vc = self._voice_clients.get(guild_id)
         return vc is not None and vc.is_connected()
+
+    # --- Streaming TTS (speak-while-generating) over a connected VC ---
+    # The gateway's StreamingTTSConsumer feeds sentence PCM via the base-class handle
+    # protocol. Playback installs a continuous _StreamingVoiceSource on the VoiceClient
+    # (one source per client, so it must displace any one-shot playback first); the player
+    # thread drains 20 ms frames while the next sentence is still synthesising.
+
+    def _voice_streaming_enabled(self) -> bool:
+        """Master gate: voice.streaming_tts in config (default False — off unless opted in)."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            vcfg = cfg.get("voice") or {}
+            return bool(vcfg.get("streaming_tts", False))
+        except Exception:
+            return False
+
+    def _guild_id_for_chat(self, chat_id: str) -> Optional[int]:
+        """chat_id -> guild_id via the text-channel binding made by /voice join."""
+        for gid, text_ch_id in self._voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id):
+                return gid
+        return None
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: "AudioFormat") -> bool:
+        if not self._voice_streaming_enabled():
+            return False
+        if not DISCORD_AVAILABLE or discord is None:
+            return False
+        # The streamer decodes to 48k/stereo/s16le; accept any s16le mono/stereo input at 48k.
+        return (audio_format.sample_rate == 48000 and audio_format.sample_width == 2
+                and audio_format.channels in (1, 2))
+
+    async def begin_streaming_tts(self, chat_id: str, audio_format: "AudioFormat",
+                                  metadata: Optional[Dict[str, Any]] = None) -> Optional["StreamingTTSHandle"]:
+        if not self.supports_streaming_tts(chat_id, audio_format):
+            return None
+        guild_id = self._guild_id_for_chat(chat_id)
+        if guild_id is None or not self.is_in_voice_channel(guild_id):
+            return None
+        vc = self._voice_clients.get(guild_id)
+        source = _StreamingVoiceSource()
+        # Receiver pause suppresses our own speech from user capture (echo prevention,
+        # mirrors the legacy play_in_voice_channel path).
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver:
+            receiver.pause()
+        # Displace any in-flight playback (one-shot clip or a previous streamed source).
+        try:
+            if vc.is_playing():
+                vc.stop()
+            if getattr(self, "_voice_streaming_sources", None) is not None:
+                self._voice_streaming_sources.pop(guild_id, None)
+        except Exception:
+            pass
+        if getattr(self, "_voice_streaming_sources", None) is None:
+            self._voice_streaming_sources = {}
+        self._voice_streaming_sources[guild_id] = (source, receiver)
+        done = asyncio.Event()
+
+        def _after(error):
+            if error:
+                logger.error("Streaming TTS playback error (guild=%d): %s", guild_id, error)
+            if receiver:
+                with suppress(Exception):
+                    receiver.resume()
+            loop = asyncio.get_event_loop()
+            with suppress(Exception):
+                loop.call_soon_threadsafe(done.set)
+
+        self._cancel_voice_timeout(guild_id)
+        vc.play(source, after=_after)
+        handle = _DiscordStreamingTTSHandle(chat_id=str(chat_id), audio_format=audio_format,
+                                            _guild_id=guild_id, _source=source, _done_event=done)
+        logger.info("Streaming TTS started in voice channel (guild=%d)", guild_id)
+        return handle
+
+    async def write_streaming_tts(self, handle: "StreamingTTSHandle", chunk: bytes) -> None:
+        if handle is None or handle.aborted:
+            return
+        source = getattr(handle, "_source", None)
+        if source is None:
+            return
+        # Normalise to 48k/stereo: mono input (a future streamer) gets duplicated.
+        fmt = handle.audio_format
+        pcm = chunk
+        if fmt.channels == 1:
+            pcm = b"".join(pcm[i:i + 2] * 2 for i in range(0, len(pcm) - 1, 2))
+        # Runs on the gateway loop; push is a thread-safe lock-protected append.
+        await asyncio.to_thread(source.push, pcm)
+
+    async def finish_streaming_tts(self, handle: "StreamingTTSHandle", *, interrupted: bool = False) -> None:
+        if handle is None or handle.aborted:
+            return
+        source = getattr(handle, "_source", None)
+        if source is None:
+            return
+        await asyncio.to_thread(source.finish)
+
+    async def abort_streaming_tts(self, handle: "StreamingTTSHandle", error: Optional[str] = None) -> None:
+        if handle is None:
+            return
+        handle.aborted = True
+        source = getattr(handle, "_source", None)
+        if source is None:
+            return
+        with suppress(Exception):
+            await asyncio.to_thread(source.cleanup)
+        # Resume the receiver: the aborted stream must not leave capture paused.
+        guild_id = getattr(handle, "_guild_id", None)
+        if guild_id is not None:
+            receiver = self._voice_receivers.get(guild_id)
+            if receiver:
+                with suppress(Exception):
+                    receiver.resume()
+        if error:
+            logger.debug("Streaming TTS aborted (guild=%s): %s", guild_id, error)
 
     def get_voice_channel_info(self, guild_id: int) -> Optional[Dict[str, Any]]:
         """Return voice channel info (name, members, count, speaking user IDs) or None if not connected."""
