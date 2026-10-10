@@ -778,6 +778,13 @@ class VoiceReceiver:
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
+    # A freshly created Opus decoder (new SSRC after rejoin, key rotation, or a
+    # decode-error reset) emits warm-up noise for its first ~300 ms of packets.
+    # Feeding that garbage to STT made the user's FIRST utterance after every
+    # rejoin hallucinate ('the', 'ok', 'Thank you.') or fail — so discard the
+    # first 300 ms of PCM per fresh decoder (48 kHz * 16-bit * stereo * 0.3 s).
+    WARMUP_SECONDS = 0.3
+    WARMUP_BYTES = int(SAMPLE_RATE * 2 * CHANNELS * WARMUP_SECONDS)
 
     def __init__(self, voice_client, allowed_user_ids: set = None):
         self._vc = voice_client
@@ -792,6 +799,9 @@ class VoiceReceiver:
         self._last_packet_time: Dict[int, float] = {}
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
+        # Per-SSRC warm-up: bytes of decoded PCM still to discard while a fresh
+        # Opus decoder ramps up (see WARMUP_BYTES).
+        self._warmup: Dict[int, int] = {}
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
         # Debug logging counter (instance-level to avoid cross-instance races)
@@ -822,6 +832,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._warmup.clear()
         logger.info("VoiceReceiver stopped")
 
     def _refresh_keys_if_changed(self) -> None:
@@ -989,8 +1000,21 @@ class VoiceReceiver:
         try:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
+                self._warmup[ssrc] = self.WARMUP_BYTES
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
+                rem = self._warmup.get(ssrc)
+                if rem is not None:
+                    skip = min(rem, len(pcm))
+                    pcm = pcm[skip:]
+                    rem -= skip
+                    if rem:
+                        self._warmup[ssrc] = rem
+                    else:
+                        self._warmup.pop(ssrc, None)
+                    if not pcm:
+                        self._last_packet_time[ssrc] = time.monotonic()
+                        return
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
         except Exception as e:
