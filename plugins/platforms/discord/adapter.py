@@ -4226,6 +4226,44 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
+    async def _transcribe_fallback_provider(self, user_id: int, wav_path: str, primary_err: str) -> Optional[Dict[str, Any]]:
+        """Retry transcription via the *other* configured command STT provider.
+
+        Returns the result dict (success or failure) or None when no alternate
+        provider is usable. Kept best-effort: any exception → None so the caller
+        just drops the utterance with the already-logged primary error.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            from tools.transcription_tools import _load_stt_config, _dispatch_stt_provider
+            stt_config = _load_stt_config()
+            primary = str(stt_config.get("provider") or "").strip()
+            providers = stt_config.get("providers") or {}
+            # Alternate = any command-type provider that is not the primary.
+            fallback = None
+            for name, pcfg in (providers or {}).items():
+                if name == primary:
+                    continue
+                if isinstance(pcfg, dict) and str(pcfg.get("type") or "").lower() == "command":
+                    fallback = name
+                    break
+            if not fallback:
+                return None
+            logger.info(
+                "Trying fallback STT provider '%s' for user %d (primary '%s' failed: %s)",
+                fallback, user_id, primary, primary_err[:120],
+            )
+            raw = (read_raw_config() or {})
+            stt_config = raw.get("stt") or stt_config
+            # Dispatch with the fallback name; _dispatch_stt_provider resolves its
+            # command config from the providers section.
+            return await asyncio.to_thread(
+                _dispatch_stt_provider, wav_path, fallback, stt_config
+            )
+        except Exception as e:
+            logger.debug("Fallback STT provider attempt failed: %s", e)
+            return None
+
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode_transcript import is_whisper_hallucination
@@ -4238,9 +4276,28 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
             from tools.transcription_tools import transcribe_audio
+            _t0 = time.monotonic()
             result = await asyncio.to_thread(transcribe_audio, wav_path)
+            _t_cost = time.monotonic() - _t0
             if not result.get("success"):
-                return
+                # Was a silent `return` — the single most confusing failure mode:
+                # the user speaks, nothing transcribes, and the logs show NOTHING.
+                # Surface the error + cost so a hang/timeout/failed provider is visible.
+                _primary_err = str(result.get("error") or result)[:200]
+                logger.warning(
+                    "Voice input transcription FAILED (user %d, %.1fs): %s",
+                    user_id, _t_cost, _primary_err,
+                )
+                # Fallback to the alternate STT provider so a user utterance is never
+                # silently lost when the primary (SenseVoice) is down/hung (2026-10-09:
+                # three drops traced to the primary while whisper would have succeeded).
+                result = await self._transcribe_fallback_provider(user_id, wav_path, _primary_err)
+                if result is None or not result.get("success"):
+                    return
+                logger.warning(
+                    "Voice input transcription recovered via fallback provider "
+                    "(user %d): %r", user_id, str(result.get("transcript", ""))[:50],
+                )
             transcript = result.get("transcript", "").strip()
             if not transcript or is_whisper_hallucination(transcript):
                 # Log the drop: a silent return here was the only path in the voice loop with
