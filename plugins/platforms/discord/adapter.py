@@ -802,6 +802,8 @@ class VoiceReceiver:
         # Per-SSRC warm-up: bytes of decoded PCM still to discard while a fresh
         # Opus decoder ramps up (see WARMUP_BYTES).
         self._warmup: Dict[int, int] = {}
+        # Total decoded user packets since start — for the silent-stall diagnostic.
+        self._packets_seen = 0
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
         # Debug logging counter (instance-level to avoid cross-instance races)
@@ -833,6 +835,7 @@ class VoiceReceiver:
             self._decoders.clear()
             self._ssrc_to_user.clear()
             self._warmup.clear()
+            self._packets_seen = 0
         logger.info("VoiceReceiver stopped")
 
     def _refresh_keys_if_changed(self) -> None:
@@ -1003,6 +1006,7 @@ class VoiceReceiver:
                 self._warmup[ssrc] = self.WARMUP_BYTES
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
+                self._packets_seen += 1
                 rem = self._warmup.get(ssrc)
                 if rem is not None:
                     skip = min(rem, len(pcm))
@@ -4203,10 +4207,25 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not receiver:
             return
         last_keepalive = time.monotonic()
+        last_heartbeat = time.monotonic()
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
                 now = time.monotonic()
+                if now - last_heartbeat >= 30:
+                    last_heartbeat = now
+                    # Silent-stall visibility (2026-10-10 00:37: two full minutes of user
+                    # speech produced ZERO log lines between 'VoiceReceiver started' and
+                    # the user's text complaint). One line per 30s makes the stall state
+                    # (paused? packets arriving? who's mapped?) greppable.
+                    with receiver._lock:
+                        logger.info(
+                            "VoiceReceiver heartbeat (guild=%d): paused=%s packets=%d "
+                            "mapped=%s buffers=%s",
+                            guild_id, receiver._paused, receiver._packets_seen,
+                            dict(receiver._ssrc_to_user),
+                            {k: len(v) for k, v in receiver._buffers.items()},
+                        )
                 if now - last_keepalive >= self._KEEPALIVE_INTERVAL:
                     last_keepalive = now
                     try:
