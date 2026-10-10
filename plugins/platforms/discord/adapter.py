@@ -993,8 +993,14 @@ class VoiceReceiver:
             pass
         return 0
 
-    def check_silence(self) -> list:
-        """Return list of (user_id, pcm_bytes) for completed utterances."""
+    def check_silence(self, silence_threshold: Optional[float] = None) -> list:
+        """Return list of (user_id, pcm_bytes) for completed utterances.
+
+        ``silence_threshold`` overrides the trailing-silence cutoff (seconds);
+        defaults to the class constant (1.5) so direct callers/tests are unaffected.
+        """
+        if silence_threshold is None:
+            silence_threshold = self.SILENCE_THRESHOLD
         now = time.monotonic()
         completed = []
         with self._lock:
@@ -1180,6 +1186,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Continuous voice mixer per guild (ambient bed + ducked speech) so acks/TTS/thinking overlap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._voice_streaming_sources: Dict[int, Any] = {}  # guild_id -> (source, receiver) streaming TTS
+        self._voice_hear_ack_tasks: Dict[int, "asyncio.Future"] = {}  # guild_id -> in-flight hear-ack task
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
@@ -3515,6 +3522,35 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT, minimum=0,
         )
 
+    def _load_voice_silence_threshold(self) -> float:
+        """Seconds of trailing silence before a buffered utterance is finalised (default 1.5).
+
+        Higher = fewer chopped-up transcriptions from natural speech pauses, at the cost of
+        ~the extra delay before each reply triggers."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get("voice_silence_threshold_seconds", 1.5)
+            return max(0.5, float(raw))
+        except Exception:
+            return VoiceReceiver.SILENCE_THRESHOLD
+
+    def _voice_hear_ack_enabled(self) -> bool:
+        """``discord.voice_hear_ack``: play a short pre-synthesised "I heard you" blip the
+        moment a voice utterance is captured (before STT/LLM), so the user gets immediate
+        feedback instead of dead air. Off by default; needs the cached ack file to exist."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            return bool((cfg.get("discord") or {}).get("voice_hear_ack", False))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _hear_ack_path() -> str:
+        # Not /tmp: the system reaps it mid-session; a lost ack file would just re-generate.
+        return os.path.expanduser("~/.hermes/cache/voice_hear_ack.mp3")
+
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
         return self._load_discord_int_config(
@@ -3668,6 +3704,64 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    async def play_hear_ack_in_voice(self, guild_id: int) -> bool:
+        """Instant 'I heard you' blip on captured user speech (before STT/LLM).
+
+        Plays the pre-synthesised cached file (no cold start); never blocks the voice
+        pipeline — callers fire it and keep going. Best-effort: any failure is a no-op.
+        """
+        if not self._voice_hear_ack_enabled() or not DISCORD_AVAILABLE or discord is None:
+            return False
+        vc = self._voice_clients.get(guild_id)
+        if not vc or not vc.is_connected():
+            return False
+        path = self._hear_ack_path()
+        if not os.path.isfile(path):
+            return False
+        self._cancel_voice_timeout(guild_id)
+        receiver = self._voice_receivers.get(guild_id)
+        try:
+            receiver_pause = receiver is not None
+            if receiver_pause:
+                receiver.pause()
+            source = discord.FFmpegPCMAudio(path, executable=resolve_ffmpeg_executable())
+            source = discord.PCMVolumeTransformer(source, volume=1.0)
+            done = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def _after(error):
+                if error:
+                    logger.debug("Hear-ack playback error (guild=%d): %s", guild_id, error)
+                with suppress(Exception):
+                    loop.call_soon_threadsafe(done.set())
+
+            vc.play(source, after=_after)
+            # Short fixed cap: the blip is <1.2s; if the socket stalls, drop it rather
+            # than deadlocking the turn (the next reply displaces it via vc.stop() anyway).
+            await asyncio.wait_for(done.wait(), timeout=2.0)
+            return True
+        except Exception as e:
+            logger.debug("play_hear_ack_in_voice failed: %s", e)
+            return False
+        finally:
+            if receiver is not None:
+                with suppress(Exception):
+                    receiver.resume()
+
+    async def _maybe_play_hear_ack(self, guild_id: int) -> None:
+        """Fire-and-forget wrapper: one hear-ack per turn, never awaited by the pipeline."""
+        pending = getattr(self, "_voice_hear_ack_tasks", {})
+        old = pending.get(guild_id)
+        if old is not None and not old.done():
+            return  # already acknowledged this burst of speech
+        task = asyncio.ensure_future(self.play_hear_ack_in_voice(guild_id))
+        pending[guild_id] = task
+
+        def _on_done(_t: "asyncio.Future") -> None:
+            pending.pop(guild_id, None)
+
+        task.add_done_callback(_on_done)
 
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
@@ -4064,7 +4158,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
-                completed = receiver.check_silence()
+                completed = receiver.check_silence(self._load_voice_silence_threshold())
                 # Pass guild so role checks stay guild-scoped.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
                 for user_id, pcm_data in completed:
@@ -4081,6 +4175,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode_transcript import is_whisper_hallucination
+        # Instant feedback before the (slow) STT/LLM round trip — never awaited.
+        with suppress(Exception):
+            await self._maybe_play_hear_ack(guild_id)
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
