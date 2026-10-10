@@ -824,6 +824,32 @@ class VoiceReceiver:
             self._ssrc_to_user.clear()
         logger.info("VoiceReceiver stopped")
 
+    def _refresh_keys_if_changed(self) -> None:
+        """Re-read the voice secret key / DAVE session; Discord rotates both on every
+        voice-WS reconnect. Cheap identity check (same object/bytes) so the hot path
+        stays a no-op; a change resets the per-SSRC Opus decoders (state is stale)."""
+        try:
+            conn = self._vc._connection
+            new_key = getattr(conn, "secret_key", None)
+            new_key = bytes(new_key) if new_key is not None else None
+            new_dave = getattr(conn, "dave_session", None)
+        except Exception:
+            return
+        if new_key is None:
+            return
+        with self._lock:
+            if new_key != self._secret_key:
+                self._secret_key = new_key
+                self._decoders.clear()
+                logger.info(
+                    "VoiceReceiver: secret key rotated (len %d) — decoders reset",
+                    len(new_key),
+                )
+            if new_dave is not self._dave_session:
+                self._dave_session = new_dave
+                self._decoders.clear()
+                logger.info("VoiceReceiver: DAVE session rotated — decoders reset")
+
     def pause(self):
         self._paused = True
 
@@ -866,6 +892,10 @@ class VoiceReceiver:
     def _on_packet(self, data: bytes):
         if not self._running or self._paused:
             return
+        # Discord rotates the voice secret key + DAVE session on every voice-WS
+        # reconnect; without re-reading them here every later packet fails NaCl
+        # decrypt and is silently dropped (mic goes deaf after a 1006).
+        self._refresh_keys_if_changed()
         self._packet_debug_count += 1
         if self._packet_debug_count <= 5:
             logger.debug(
@@ -3734,7 +3764,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if error:
                     logger.debug("Hear-ack playback error (guild=%d): %s", guild_id, error)
                 with suppress(Exception):
-                    loop.call_soon_threadsafe(done.set())
+                    loop.call_soon_threadsafe(done.set)
 
             vc.play(source, after=_after)
             # Short fixed cap: the blip is <1.2s; if the socket stalls, drop it rather
