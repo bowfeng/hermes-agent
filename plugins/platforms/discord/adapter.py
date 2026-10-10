@@ -1216,6 +1216,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Continuous voice mixer per guild (ambient bed + ducked speech) so acks/TTS/thinking overlap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._voice_streaming_sources: Dict[int, Any] = {}  # guild_id -> (source, receiver) streaming TTS
+        self._voice_streaming_handles: Dict[int, Any] = {}  # guild_id -> last streaming handle (safety-net resume check)
         self._voice_hear_ack_tasks: Dict[int, "asyncio.Future"] = {}  # guild_id -> in-flight hear-ack task
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
@@ -4061,6 +4062,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if getattr(self, "_voice_streaming_sources", None) is None:
             self._voice_streaming_sources = {}
         self._voice_streaming_sources[guild_id] = (source, receiver)
+        self._voice_streaming_handles[guild_id] = None  # set after handle creation below
         done = asyncio.Event()
         # Capture the loop up front: _after runs on discord.py's audio-player thread, where
         # asyncio.get_event_loop() raises on Python 3.12+ (no running loop in that thread).
@@ -4079,6 +4081,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         vc.play(source, after=_after)
         handle = _DiscordStreamingTTSHandle(chat_id=str(chat_id), audio_format=audio_format,
                                             _guild_id=guild_id, _source=source, _done_event=done)
+        self._voice_streaming_handles[guild_id] = handle
         logger.info("Streaming TTS started in voice channel (guild=%d)", guild_id)
         return handle
 
@@ -4189,6 +4192,27 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     except Exception:
                         pass
                 completed = receiver.check_silence(self._load_voice_silence_threshold())
+                # Safety net for the streaming-TTS receiver pause (2026-10-09 20:16
+                # incident: a barge-in aborted the adapter handle, but the async
+                # _safe_abort task never ran — receiver.resume() was skipped and the
+                # mic stayed deaf until a manual /voice leave+join). If the stream's
+                # adapter handle is aborted, the source can never resume the receiver
+                # itself; force it and clear the slot.
+                src_map = getattr(self, "_voice_streaming_sources", None)
+                if src_map and guild_id in src_map:
+                    try:
+                        _src, _rcv = src_map[guild_id]
+                        _h = getattr(self, "_voice_streaming_handles", {}).get(guild_id)
+                        if getattr(_h, "aborted", False) and _rcv is not None:
+                            logger.warning(
+                                "Streaming TTS handle aborted but receiver still paused "
+                                "(guild=%d) — force-resuming receiver", guild_id,
+                            )
+                            with suppress(Exception):
+                                _rcv.resume()
+                            src_map.pop(guild_id, None)
+                    except Exception:
+                        pass
                 # Pass guild so role checks stay guild-scoped.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
                 for user_id, pcm_data in completed:
