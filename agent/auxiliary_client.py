@@ -3371,6 +3371,13 @@ def _is_structured_output_rejection(exc: Exception) -> bool:
     # vLLM grammar-backend failures name the translated parameter, not ours.
     if _contains_any(err_lower, ("guided_grammar", "xgrammar", "compile_grammar_error")):
         return True
+    # NInfer (and similar constrained-decoding gates) reject structured output with
+    # error code ``response_format_not_supported`` and a message that names the field but
+    # uses no recognized unsupported-marker ("this response_format requires constrained
+    # output, which <provider> cannot guarantee; only {\"type\":\"text\"} is available").
+    # Same remedy: one retry without the format; the prompt already constrains the shape.
+    if _contains_any(err_lower, ("response_format_not_supported", "requires constrained output")):
+        return True
     if "extra inputs are not permitted" in err_lower and (
         "response_format" in err_lower or "output_config" in err_lower
     ):

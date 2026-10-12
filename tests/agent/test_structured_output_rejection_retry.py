@@ -80,6 +80,14 @@ class TestIsStructuredOutputRejection:
         "Gemini HTTP 400 (INVALID_ARGUMENT): Function calling with a response mime type: 'application/json' is unsupported",
         "Gemini HTTP 400 (INVALID_ARGUMENT): Invalid JSON payload received. Unknown name \"response_json_schema\" at 'generation_config'",
         "Gemini HTTP 400 (INVALID_ARGUMENT): Invalid value at 'generation_config.response_schema.properties[0].value.type'",
+        # NInfer (constrained-decoding gate) verbatim 400: names the field but uses no
+        # recognized unsupported-marker, so it only matches via the dedicated branch.
+        (
+            "Error code: 400 - {'error': {'code': 'response_format_not_supported', "
+            "'message': 'this response_format requires constrained output, which "
+            "NInfer cannot guarantee; only {\"type\":\"text\"} is available', "
+            "'param': 'response_format', 'type': 'invalid_request_error'}}"
+        ),
     ])
     def test_matches_real_provider_messages(self, message):
         assert _is_structured_output_rejection(RuntimeError(message)) is True
