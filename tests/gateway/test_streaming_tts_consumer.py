@@ -28,7 +28,10 @@ from tools.tts_streaming import SentenceChunker
 
 
 class FakeStreamer:
-    """Fake streaming provider that yields deterministic PCM chunks."""
+    """Fake streaming provider that yields deterministic PCM chunks.
+
+    Chunk numbers follow the stream() call count — failed attempts count too — so
+    a retried clause's successful chunks are numbered after the intervening calls."""
 
     def __init__(self, chunks_per_clause=3, fail_on_clause=None, sample_rate=24000, channels=1, sample_width=2):
         self.chunks_per_clause = chunks_per_clause
@@ -134,6 +137,8 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._task = None
     consumer._lock = threading.Lock()
     consumer._strip_markdown = None
+    # 断点续播 stream-level budget (normally set in __init__, skipped here via __new__).
+    consumer._consecutive_clause_failures = 0
     return consumer
 
 
@@ -595,6 +600,179 @@ class FinishFailingAdapter(FakeVoiceAdapter):
 
     async def finish_streaming_tts(self, handle, *, interrupted=False):
         raise RuntimeError("adapter finish failure")
+
+
+# ---------------------------------------------------------------------------
+# 断点续播: a clause whose provider connection dies mid-playback is re-synthesised
+# over a fresh connection instead of killing the whole utterance
+# ---------------------------------------------------------------------------
+
+
+class FlakeyClauseStreamer(FakeStreamer):
+    """Deterministic failure injection for resume tests.
+
+    ``always_fail`` = endpoint dead: raises BEFORE any PCM (real connect failure).
+    ``fail_once={clause text}`` = mid-stream drop: yields a partial chunk first,
+    then raises (real behaviour: the player already heard the half)."""
+
+    def __init__(self, fail_once=(), always_fail=False, **kwargs):
+        super().__init__(**kwargs)
+        self.fail_once = set(fail_once)
+        self.always_fail = always_fail
+        self.attempts = {}
+
+    def stream(self, text):
+        self.attempts[text] = self.attempts.get(text, 0) + 1
+        if self.always_fail:
+            raise RuntimeError(f"endpoint dead ({text!r})")
+        if text in self.fail_once and self.attempts[text] == 1:
+            yield b"partial-"
+            raise RuntimeError(f"connection dropped mid-clause ({text!r})")
+        yield from super().stream(text)
+
+
+class TestClauseFailureResume:
+    """Mid-playback clause failure: retry the clause, never the whole utterance."""
+
+    def test_failed_clause_is_retried_and_story_continues(self):
+        async def run(loop):
+            adapter = FakeVoiceAdapter()
+            streamer = FlakeyClauseStreamer(
+                fail_once={"This is the second failing sentence."}, chunks_per_clause=1)
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+
+            consumer.start()
+            consumer.on_delta("This is the first long sentence. ")
+            consumer.on_delta("This is the second failing sentence. ")
+            consumer.on_delta("This is the third long sentence. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is True
+            assert adapter.abort_count == 0
+            assert adapter.finish_count == 1
+            # The failed clause was synthesised twice (fresh connection), the rest once.
+            # (The chunker strips trailing spaces from clause keys.)
+            assert streamer.attempts == {
+                "This is the first long sentence.": 1,
+                "This is the second failing sentence.": 2,
+                "This is the third long sentence.": 1,
+            }
+            # Retry is requeued at the HEAD, so the failed clause plays in place; its
+            # half-written PCM prefix stays (chunks played before the drop remain).
+            # Failed attempts don't call super().stream() so they don't consume a chunk
+            # number: first=1, retry(second)=2, third=3.
+            assert adapter.written_chunks == [
+                b"chunk-1-0", b"partial-", b"chunk-2-0", b"chunk-3-0",
+            ]
+
+        _run_test(run)
+
+    def test_same_clause_failing_twice_is_skipped_and_story_continues(self):
+        """In-clause retry budget exhausted while other audio plays: drop the clause, keep going."""
+        async def run(loop):
+            class _OneDeadClause(FlakeyClauseStreamer):
+                def stream(self, text):
+                    if text == "This is the always dead sentence.":
+                        self.attempts[text] = self.attempts.get(text, 0) + 1
+                        raise RuntimeError("dead clause")
+                    yield from super().stream(text)
+
+            adapter = FakeVoiceAdapter()
+            streamer = _OneDeadClause(
+                fail_once={"This is the flaky first sentence."}, chunks_per_clause=1)
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+
+            consumer.start()
+            consumer.on_delta("This is the flaky first sentence. ")
+            consumer.on_delta("This is the always dead sentence. ")
+            consumer.on_delta("This is the final tail sentence. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is False  # a clause was dropped: not full completion
+            assert adapter.abort_count == 0
+            assert adapter.finish_count == 1
+            assert consumer.suppress_whole_file is True  # no replay from the start
+            assert streamer.attempts["This is the always dead sentence."] == 3  # 1 + 2 retries, then skipped
+            assert streamer.attempts["This is the flaky first sentence."] == 2  # failed once, retried
+            assert streamer.attempts["This is the final tail sentence."] == 1
+            # Order (retry plays in place at the head): flaky-first's half (before the
+            # drop), then flaky-first's full retry, then tail.  Failed attempts don't
+            # call super().stream() so _clause_count only counts successes: retry=1, tail=2.
+            assert adapter.written_chunks == [b"partial-", b"chunk-1-0", b"chunk-2-0"]
+
+        _run_test(run)
+
+    def test_dead_endpoint_pre_audio_falls_back_whole_file(self):
+        """Endpoint dead from the start: retries + budget exhaust pre-audio -> whole-file fallback
+        (legacy semantics), not a silent partial."""
+        async def run(loop):
+            adapter = FakeVoiceAdapter()
+            streamer = FlakeyClauseStreamer(always_fail=True, chunks_per_clause=1)
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+
+            consumer.start()
+            consumer.on_delta("This is the only dying sentence. ")
+            consumer.on_delta("This is a second dying sentence. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is False
+            assert consumer.suppress_whole_file is False  # whole-file TTS may replay
+            assert adapter.begin_count == 0
+            assert adapter.abort_count == 0
+            # Endpoint dead pre-audio: clause 1 fails 3x (1 + 2 retries) with no PCM
+            # ever written — legacy whole-file fallback; clause 2 is never synthesised
+            # (drain loop exits, finally drains the queue).
+            assert streamer.attempts["This is the only dying sentence."] == 3
+            assert streamer.attempts.get("This is a second dying sentence.", 0) == 0
+
+        _run_test(run)
+
+    def test_dead_endpoint_mid_stream_drops_clause_and_keeps_playing(self):
+        """Endpoint dies after audio is playing: retries exhaust, clause skipped, story continues
+        to the end instead of aborting the utterance (the 西游记 断线事故 fix)."""
+        async def run(loop):
+            adapter = FakeVoiceAdapter()
+            streamer = FakeStreamer(chunks_per_clause=1)
+            # Clause 1 plays; clause 2's connection dies forever (always_fail from clause 2 on);
+            # clause 3 plays.
+            class _DieFromClause2(FakeStreamer):
+                def __init__(self):
+                    super().__init__(chunks_per_clause=1)
+                    self.attempts = {}
+                def stream(self, text):
+                    if text.startswith("This is the second"):
+                        self.attempts["second"] = self.attempts.get("second", 0) + 1
+                        raise RuntimeError("WS connection timed out")
+                    yield text.encode() + b"0"
+
+            streamer2 = _DieFromClause2()
+            consumer = _make_consumer(adapter, "chat1", loop, streamer2)
+
+            consumer.start()
+            consumer.on_delta("This is the first sentence here. ")
+            consumer.on_delta("This is the second dying sentence. ")
+            consumer.on_delta("This is the third sentence here. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is False  # clause 2 was dropped
+            assert adapter.abort_count == 0  # the story was NOT aborted mid-air
+            assert adapter.finish_count == 1
+            assert consumer.suppress_whole_file is True
+            assert consumer.partial is True
+            # Clause 2 was attempted 3x (1 + 2 retries) then skipped; clauses 1 and 3
+            # still played (the "西游记 断线事故" fix: no mid-air abort).  The stream()
+            # text is stripped, so the written chunks carry no trailing space.
+            assert streamer2.attempts["second"] == 3
+            assert adapter.written_chunks == [
+                b"This is the first sentence here.0",
+                b"This is the third sentence here.0",
+            ]
+
+        _run_test(run)
 
 
 class TestAdapterFinishFailure:

@@ -5,6 +5,14 @@
 PCM so playback starts mid-generation. Outcome: success -> ``completed``; failure before audible
 output -> ``suppress_whole_file=False`` (gateway falls back to whole-file TTS); failure after
 partial audio -> ``partial`` + suppress (never replay the response from the beginning).
+
+Clause failures are *resumable* (断点续播): a clause whose provider connection dies mid-playback
+is re-synthesised over a fresh connection instead of aborting the whole utterance.  In-clause
+retries are bounded by ``_MAX_CLAUSE_RETRIES`` and a stream-level budget
+(``_MAX_CONSECUTIVE_FAILURES``) stops a persistently dead endpoint from spinning the queue —
+one clean clause resets the budget.  The only failure that still kills the stream is the
+pre-audio adapter-handle decline (gateway whole-file fallback) and an exhausted budget, which
+settle ``partial`` + suppress just like the legacy behaviour.
 """
 
 from __future__ import annotations
@@ -23,6 +31,8 @@ logger = logging.getLogger("gateway.streaming_tts_consumer")
 
 _ABORT = object()
 _DONE = object()
+_MAX_CLAUSE_RETRIES = 2        # fresh provider connections per clause
+_MAX_CONSECUTIVE_FAILURES = 4  # stream-level budget; one clean clause resets it
 
 
 class _HandleDeclined(Exception):
@@ -53,6 +63,13 @@ class StreamingTTSConsumer:
         # Monotonic timestamp of the last audible progress (task start / clause fetch / PCM write).
         # Callers use it to tell "slow but progressing" (keep waiting) from "stuck" (abort).
         self._last_progress = time.monotonic()
+        # 断点续播: a clause whose provider stream dies is re-synthesised INLINE (head-of-line,
+        # up to _MAX_CLAUSE_RETRIES extra attempts over fresh connections) instead of killing
+        # the whole utterance; the queue is never mutated mid-drain.  ``_consecutive_clause_failures``
+        # is the stream-level budget (_MAX_CONSECUTIVE_FAILURES): one clean clause resets it, so
+        # a persistently dead endpoint eventually skips the clause (after audio) or settles
+        # pre-audio (whole-file fallback) instead of spinning.
+        self._consecutive_clause_failures = 0
 
     def _streamer_format(self) -> AudioFormat:
         return AudioFormat(**{f: int(getattr(self._streamer, f, getattr(AudioFormat, f)))
@@ -165,15 +182,62 @@ class StreamingTTSConsumer:
                 if not isinstance(item, str):
                     continue
                 self._last_progress = time.monotonic()  # fresh clause fetched: pipeline is moving
-                try:
-                    await self._synthesise_and_write(item)
-                except _HandleDeclined:
+                # 断点续播 (inline, head-of-line): on a provider-stream failure, re-synthesise
+                # the SAME clause over a fresh connection up to _MAX_CLAUSE_RETRIES extra
+                # times before deciding.  A dead endpoint thus costs one clause (dropped) and
+                # playback keeps going — the whole utterance is never aborted mid-air.  The
+                # queue is never touched here, so there is no producer race and no
+                # get_nowait/put_nowait juggling to deadlock.
+                attempts = 0
+                outcome = None  # None | "clean" | "skip" | "give_up"
+                last_exc: Exception | None = None
+                while attempts <= _MAX_CLAUSE_RETRIES:
+                    attempts += 1
+                    try:
+                        await self._synthesise_and_write(item)
+                    except _HandleDeclined:
+                        outcome = "declined"
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        self._consecutive_clause_failures += 1
+                        over_budget = self._consecutive_clause_failures > _MAX_CONSECUTIVE_FAILURES
+                        nothing_audible = self._handle is None or not self._handle.audible
+                        logger.warning(
+                            "streaming TTS clause failed (attempt %d/%d, failures %d/%d): %s",
+                            attempts, _MAX_CLAUSE_RETRIES + 1,
+                            self._consecutive_clause_failures, _MAX_CONSECUTIVE_FAILURES, exc,
+                        )
+                        if attempts <= _MAX_CLAUSE_RETRIES:
+                            continue  # retry inline over a fresh provider connection
+                        # All attempts used up: decide from the stream-level budget + audio state.
+                        if nothing_audible:
+                            outcome = "give_up"  # nothing heard yet -> whole-file fallback
+                        elif over_budget:
+                            outcome = "skip"     # story is playing -> drop this clause, go on
+                        else:
+                            outcome = "skip"     # budget intact but clause kept dying -> drop
+                        break
+                    else:
+                        outcome = "clean"
+                        break
+                if outcome == "clean":
+                    self._consecutive_clause_failures = 0  # clean clause resets the budget
+                    continue
+                if outcome == "declined":
                     return  # nothing audible yet: gateway falls back to whole-file TTS
-                except Exception as exc:
-                    logger.warning("streaming TTS clause failed: %s", exc)
+                if outcome == "give_up":
+                    logger.warning("streaming TTS gave up after retries: %s", last_exc)
                     self._settle(failed=True)
-                    await self._safe_abort(str(exc))
+                    await self._safe_abort(str(last_exc))
                     return
+                # outcome == "skip": audible story continues without this clause.
+                self._dropped = True
+                logger.warning(
+                    "streaming TTS clause skipped after %d attempts (failures %d/%d): %s",
+                    attempts, self._consecutive_clause_failures, _MAX_CONSECUTIVE_FAILURES, last_exc,
+                )
+                continue
             if not self._aborted and self._handle is not None:
                 try:
                     handle, interrupted = self._handle, self._aborted
